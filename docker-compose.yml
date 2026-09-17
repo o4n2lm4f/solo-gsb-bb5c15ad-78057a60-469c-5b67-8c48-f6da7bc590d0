@@ -8,10 +8,25 @@ services:
     ports:
       - "8000:8000"
     restart: unless-stopped
+    environment:
+      # SQLite database backing the asynchronous /jobs API.
+      RESOLVER_DB_PATH: /data/resolver.db
+      # Number of concurrent job workers (each claims jobs atomically).
+      JOB_WORKERS: "1"
+      JOB_POLL_INTERVAL: "0.1"
+    volumes:
+      # Named volume: jobs and their results survive `docker compose down`
+      # and image rebuilds.  Remove it with `docker compose down -v` to
+      # start from a clean database.
+      - resolver-data:/data
     # The service only needs the loopback/network you expose; it never calls
     # an external package index.
     networks:
       - resolver-net
+
+volumes:
+  resolver-data:
+    driver: local
 
 networks:
   resolver-net:

@@ -5,3 +5,8 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
+# Local SQLite job database (default RESOLVER_DB_PATH=data/resolver.db)
+data/
+*.db
+*.db-wal
+*.db-shm

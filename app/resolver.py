@@ -19,12 +19,21 @@ Resolution strategy
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
+
+
+class ResolutionCancelled(Exception):
+    """Raised when a cooperative ``should_continue`` callback requests a stop.
+
+    The check is performed only at candidate-evaluation boundaries, so a
+    cancellation request leaves no partial result behind: the solver stack
+    simply unwinds and the job can be marked ``cancelled``.
+    """
 
 # ---------------------------------------------------------------------------
 # Parsed data model
@@ -366,6 +375,7 @@ def resolve(
     allow_prereleases: bool = False,
     marker_env: Optional[dict[str, str]] = None,
     max_attempts: int = 100_000,
+    should_continue: Optional[Callable[[], bool]] = None,
 ) -> SolveResult:
     import sys
 
@@ -490,6 +500,11 @@ def resolve(
 
         for candidate in candidates:
             attempts += 1
+            # Cooperative cancellation boundary: checked before every single
+            # candidate evaluation, so a running job stops between candidates
+            # and never leaves a partially applied selection.
+            if should_continue is not None and not should_continue():
+                raise ResolutionCancelled()
             if attempts > max_attempts:
                 limit = CompositeConflict(
                     package=package,
