@@ -26,6 +26,8 @@
   - 候选版本清单与已尝试版本，以及整棵失败分支树，而不是一句笼统错误。
 - **PEP 508**：依赖可写成 `name[extra] spec; marker` 字符串；环境标记在固定的
   默认环境下求值（可用 `marker_env` 覆盖），保证结果可复现。
+- **同步 + 异步两种用法**：`POST /resolve` 立即返回；`POST /jobs` 把同样的请求
+  持久化到 SQLite 后由后台 worker 顺序执行，可查询、可协作取消，重启自动恢复。
 
 ## 一条命令启动
 
@@ -38,10 +40,88 @@ docker compose up --build
 服务监听 **http://localhost:8000**：
 
 - `GET /health` — 健康检查
-- `POST /resolve` — 解析依赖
+- `POST /resolve` — 同步解析依赖（保持原有行为不变）
+- `POST /jobs` — 提交异步解析作业（立即返回 `202` 与作业 ID）
+- `GET /jobs/{id}` — 查询作业状态与最终响应
+- `DELETE /jobs/{id}` — 取消作业
 - `GET /docs` — 交互式 OpenAPI 文档（Swagger UI）
 
 镜像在构建时安装固定版本依赖；运行时不访问任何外部仓库。
+
+## 异步作业 API
+
+对于回溯很深、耗时较长的解析，可以用与 `/resolve` **完全相同的请求体**提交
+一个持久化作业，由内置 worker 在后台顺序执行（FIFO）。状态保存在 SQLite 中，
+服务重启、容器重建后作业与结果仍然保留（见[数据持久化](#数据持久化)）。
+
+### 提交作业
+
+```bash
+curl -s -X POST localhost:8000/jobs -H 'Content-Type: application/json' -d '{
+  "packages": { "x": {"1.0": {}, "2.0": {}} },
+  "root": { "x": ">=1.0" }
+}'
+```
+
+返回 `202 Accepted`，并通过 `Location: /jobs/{id}` 给出查询地址：
+
+```json
+{
+  "id": "59150780924745849a94bbe17e0d5155",
+  "status": "queued",
+  "created_at": "2026-09-17T08:00:00.000000+00:00",
+  "started_at": null,
+  "finished_at": null
+}
+```
+
+入队前会做与 `/resolve` 一致的语法/语义校验：非法请求直接返回 `400/422`，
+不会产生注定失败的作业。
+
+### 查询作业
+
+```bash
+curl -s localhost:8000/jobs/59150780924745849a94bbe17e0d5155
+```
+
+状态机：`queued → running → succeeded | failed | cancelled`。
+
+- `queued` / `running`：返回时间戳；running 时若已请求取消，还会带
+  `"cancel_requested": true` 与当前已求值的候选次数 `attempts`。
+- `succeeded`：`response` 即同步 `/resolve` 的完整响应体，`response_status`
+  为其原本的 HTTP 状态码（解析成功 `200`；无解/触顶为 `409`，与同步接口一致）。
+- `failed`：作业执行出现异常，`error` 给出错误码与信息。
+- `cancelled`：已取消（不包含 `response`，终态不可更改）。
+
+### 取消作业
+
+```bash
+curl -s -X DELETE localhost:8000/jobs/{id}
+```
+
+- **queued**：立即转为 `cancelled`，返回 `200`；
+- **running**：worker 在**下一个候选求值边界**协作式停止，作业随即变为
+  `cancelled`（不会在回溯分支中途停在不一致状态），返回 `202`；
+- **cancelled**：幂等，再次取消返回 `200`；
+- **succeeded / failed**：终态受保护，返回 `409`，原结果不会被覆盖。
+
+### 崩溃恢复
+
+worker 以单条 `BEGIN IMMEDIATE` 事务原子领取最早的 `queued` 作业（按入队顺序，
+FIFO），因此即使将来扩容为多个 worker 也不会重复领取同一作业。每次启动时，
+上一进程遗留的 `running` 作业会被退回 `queued` 重新排队；若遗留作业此前已收到
+取消请求，则直接终结为 `cancelled`。
+
+## 数据持久化
+
+异步作业保存在 SQLite（WAL 模式），数据库路径由环境变量 `RESOLVER_DB` 控制，
+默认 `./data/jobs.db`。`docker compose up --build` 通过命名卷 `resolver-data`
+挂载到容器内的 `/app/data`，因此：
+
+- 重建镜像、重启容器后，已排队和已完成的作业都还在；
+- 未完成的作业在启动时自动重新入队执行。
+
+如需清空历史，可删除卷：`docker compose down -v`。
 
 ## 请求格式
 
@@ -171,6 +251,9 @@ pip install pytest httpx
 pytest -q
 ```
 
+本地运行时作业库默认创建在 `./data/jobs.db`（已加入 `.gitignore`），可用
+`RESOLVER_DB=/path/to/jobs.db` 覆盖。
+
 ## 解析策略说明
 
 - 每个包维护当前所有生效约束的交集；候选必须同时满足全部约束。
@@ -184,10 +267,12 @@ pytest -q
 
 ```
 app/
-  resolver.py    # PEP 440/508 解析、候选排序、回溯求解器、冲突数据结构
+  resolver.py    # PEP 440/508 解析、候选排序、回溯求解器、冲突数据结构、取消点
   serialize.py   # 冲突树 / 终态冲突的 JSON 序列化
-  main.py        # FastAPI 应用与 /resolve、/health
-tests/           # 端到端 API 测试与求解器单元测试（含随机暴力对照）
+  jobs.py        # SQLite 作业存储、BEGIN IMMEDIATE 原子领取、后台 worker
+  main.py        # FastAPI 应用与 /resolve、/jobs、/health
+tests/           # 端到端 API 测试、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
+data/            # 运行时生成：SQLite 数据库（RESOLVER_DB，已 gitignore）
 Dockerfile
 docker-compose.yml
 requirements.txt

@@ -19,7 +19,7 @@ Resolution strategy
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import SpecifierSet
@@ -33,6 +33,19 @@ from packaging.version import InvalidVersion, Version
 
 class ResolutionInputError(ValueError):
     """Semantically invalid request payload (mapped to HTTP 400)."""
+
+
+class ResolutionCancelled(BaseException):
+    """Raised at a candidate-evaluation boundary when the job is cancelled.
+
+    BaseException on purpose: cooperative cancellation must not be swallowed
+    by ``except Exception`` while unwinding the solver.  Carries the number
+    of candidate evaluations already made.
+    """
+
+    def __init__(self, attempts: int = 0) -> None:
+        super().__init__("resolution cancelled")
+        self.attempts = attempts
 
 
 @dataclass(frozen=True)
@@ -366,6 +379,7 @@ def resolve(
     allow_prereleases: bool = False,
     marker_env: Optional[dict[str, str]] = None,
     max_attempts: int = 100_000,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> SolveResult:
     import sys
 
@@ -489,6 +503,11 @@ def resolve(
         branch_failures: list[Any] = []
 
         for candidate in candidates:
+            # Cooperative cancellation point: exactly one candidate
+            # evaluation boundary, so a running job stops between candidates
+            # rather than mid-branch.
+            if should_cancel is not None and should_cancel():
+                raise ResolutionCancelled(attempts)
             attempts += 1
             if attempts > max_attempts:
                 limit = CompositeConflict(

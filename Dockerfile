@@ -18,8 +18,13 @@ COPY app ./app
 
 # Run as an unprivileged user.
 RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /app/data \
     && chown -R appuser:appuser /app
 USER appuser
+
+# SQLite database holding asynchronous /jobs state. A named volume mounted
+# here keeps queued/running/finished jobs across container rebuilds.
+VOLUME ["/app/data"]
 
 EXPOSE 8000
 
