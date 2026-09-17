@@ -1,0 +1,18 @@
+services:
+  resolver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: local-dep-resolver:latest
+    container_name: local-dep-resolver
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    # The service only needs the loopback/network you expose; it never calls
+    # an external package index.
+    networks:
+      - resolver-net
+
+networks:
+  resolver-net:
+    driver: bridge
